@@ -17,5 +17,7 @@ int meta_find_barrel_game(int curSelection);
 void meta_thread_start(void *loadingBox);
 void meta_thread_stop();
 void meta_free(file_meta* meta);
+void meta_free_cover(file_meta* meta);
+bool meta_load_cover(file_handle *f);
 #endif
 

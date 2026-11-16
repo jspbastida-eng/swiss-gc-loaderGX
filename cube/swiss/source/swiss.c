@@ -539,8 +539,58 @@ void drawFilesCarousel(file_handle** directory, int num_files, uiDrawObj_t *cont
 	}
 }
 
+// Adds one cover flow entry (distance d from the selected one) to the panel
+static void addCoverflowEntry(file_handle** directory, int i, int d, uiDrawObj_t *containerPanel) {
+	int fbMid = getVideoMode()->fbWidth / 2;
+	int main_w = 168, main_h = 235;		// selected cover (160x224 art, slightly enlarged)
+	int y_base = 112;
+	int y_mid = y_base + main_h/2;
+	int x1, x2, y1, y2;
+	if(d == 0) {
+		x1 = fbMid - main_w/2; x2 = fbMid + main_w/2;
+		y1 = y_base; y2 = y_base + main_h;
+	}
+	else {
+		int n = abs(d);
+		int w = 64;
+		int h = 210 - 14*(n-1);
+		int offset = main_w/2 + 44 + (n-1)*52;	// distance from the middle of the screen to the middle of this entry
+		int cx = (d < 0) ? fbMid - offset : fbMid + offset;
+		x1 = cx - w/2; x2 = cx + w/2;
+		y1 = y_mid - h/2; y2 = y_mid + h/2;
+	}
+	lockFile(directory[i]);
+	populate_meta(directory[i]);
+	meta_load_cover(directory[i]);
+	uiDrawObj_t *browserObject = DrawFileCoverflowEntry(x1, y1, x2, y2,
+								getRelativePath(directory[i]->name, curDir.name), directory[i], d);
+	directory[i]->uiObj = browserObject;
+	unlockFile(directory[i]);
+	DrawAddChild(containerPanel, browserObject);
+}
+
+// Cover flow: like the carousel, but with box art. Uses the same input handling and game loading.
+void drawFilesCoverflow(file_handle** directory, int num_files, uiDrawObj_t *containerPanel) {
+	current_view_start = MAX(0,curSelection-FILES_PER_PAGE_CAROUSEL/2);
+	current_view_end = MIN(num_files,curSelection+(FILES_PER_PAGE_CAROUSEL+1)/2);
+	drawCurrentDeviceCarousel(containerPanel);
+	if(num_files > 0) {
+		// Draw which directory we're in
+		sprintf(txtbuffer, "%s", getDevicePath(&curDir.name[0]));
+		float scale = GetTextScaleToFitInWidthWithMax(txtbuffer, (getVideoMode()->fbWidth-60), .85);
+		DrawAddChild(containerPanel, DrawStyledLabel(30, 90, txtbuffer, scale, ALIGN_LEFT, defaultColor));
+		// Far entries first so the nearer ones (and finally the selected one) are drawn on top
+		int maxDist = MAX(curSelection - current_view_start, (current_view_end - 1) - curSelection);
+		for(int n = maxDist; n > 0; n--) {
+			if(curSelection - n >= current_view_start) addCoverflowEntry(directory, curSelection - n, -n, containerPanel);
+			if(curSelection + n < current_view_end) addCoverflowEntry(directory, curSelection + n, n, containerPanel);
+		}
+		addCoverflowEntry(directory, curSelection, 0, containerPanel);
+	}
+}
+
 // Carousel (one main file in the middle, entries to either side)
-uiDrawObj_t* renderFileCarousel(file_handle** directory, int num_files, uiDrawObj_t* filePanel)
+uiDrawObj_t* renderFileCarousel(file_handle** directory, int num_files, uiDrawObj_t* filePanel, bool coverflow)
 {
 	memset(txtbuffer,0,sizeof(txtbuffer));
 	if(num_files<=0) {
@@ -558,7 +608,8 @@ uiDrawObj_t* renderFileCarousel(file_handle** directory, int num_files, uiDrawOb
 		u32 retraceCount = VIDEO_GetRetraceCount();
 		DrawUpdateProgressLoading(loadingBox, +1);
 		uiDrawObj_t *newPanel = DrawContainer();
-		drawFilesCarousel(directory, num_files, newPanel);
+		if(coverflow) drawFilesCoverflow(directory, num_files, newPanel);
+		else drawFilesCarousel(directory, num_files, newPanel);
 		filePanel = DrawRepublish(filePanel, newPanel);
 		DrawUpdateProgressLoading(loadingBox, -1);
 		
@@ -2939,7 +2990,10 @@ void menu_loop()
 					filePanel = renderFileBrowser(getSortedDirEntries(), getSortedDirEntryCount(), filePanel);
 					break;
 				case BROWSER_CAROUSEL:
-					filePanel = renderFileCarousel(getSortedDirEntries(), getSortedDirEntryCount(), filePanel);
+					filePanel = renderFileCarousel(getSortedDirEntries(), getSortedDirEntryCount(), filePanel, false);
+					break;
+				case BROWSER_COVERFLOW:
+					filePanel = renderFileCarousel(getSortedDirEntries(), getSortedDirEntryCount(), filePanel, true);
 					break;
 				case BROWSER_FULLWIDTH:
 					filePanel = renderFileFullwidth(getSortedDirEntries(), getSortedDirEntryCount(), filePanel);

@@ -37,14 +37,155 @@ static void* meta_cache = NULL;
 static mspace meta_mspace = NULL;
 static lwp_t meta_thread = LWP_THREAD_NULL;
 
+/* Cover art cache
+ *
+ * Covers are read on demand (only for entries visible in the cover flow) into a
+ * fixed-size pool so they can never eat into the rest of MEM1. When the pool is
+ * full, covers belonging to entries that are no longer on screen are evicted.
+ *
+ * Cover files live on the same device as the game, at:
+ *   swiss/covers/<GAMEID6>.cvr   e.g. swiss/covers/GALE01.cvr
+ *   swiss/covers/<GAMEID4>.cvr   e.g. swiss/covers/GALE.cvr (any region/company)
+ *   swiss/covers/<file name without extension>.cvr (DOLs, folders, unknown IDs)
+ *
+ * .cvr format (big endian, made by pc/covers/make_covers.py):
+ *   0x00 char[4] "SWCV"
+ *   0x04 u16     width  (multiple of 8, max COVER_MAX_DIM)
+ *   0x06 u16     height (multiple of 8, max COVER_MAX_DIM)
+ *   0x08 u8      GX texture format (GX_TF_CMPR, GX_TF_RGB565 or GX_TF_RGB5A3)
+ *   0x09 u8[23]  reserved (zero)
+ *   0x20         texture data, GX_GetTexBufferSize(width, height, format, 0, 0) bytes
+ */
+#define COVER_MAGIC			"SWCV"
+#define COVER_HEADER_SIZE	32
+#define COVER_MAX_DIM		256
+#define COVER_MAX_SIZE		(COVER_MAX_DIM * COVER_MAX_DIM * 2)
+#define COVER_CACHE_SIZE	(1536 * 1024)	// ~85 CMPR covers at 160x224, plenty for 9 on screen
+
+static void* cover_cache = NULL;
+static mspace cover_mspace = NULL;
+
+void meta_free_cover(file_meta* meta) {
+	if(meta && meta->cover) {
+		mspace_free(cover_mspace, meta->cover);
+		meta->cover = NULL;
+		meta->coverSize = 0;
+		meta->coverTried = false;
+	}
+}
+
 void meta_free(file_meta* meta) {
 	if(meta) {
 		if(meta->banner) {
 			free(meta->banner);
 			meta->banner = NULL;
 		}
+		meta_free_cover(meta);
 		free(meta);
 	}
+}
+
+static void* cover_alloc(u32 size) {
+	if(!cover_cache) {
+		cover_cache = memalign(32, COVER_CACHE_SIZE);
+		if(cover_cache) cover_mspace = create_mspace_with_base(cover_cache, COVER_CACHE_SIZE, 1);
+		if(cover_mspace) mspace_set_footprint_limit(cover_mspace, COVER_CACHE_SIZE);
+	}
+	if(!cover_mspace) return NULL;
+
+	void *ptr = mspace_memalign(cover_mspace, 32, size);
+	// Pool full: evict covers of entries that are off screen until it fits
+	while(!ptr) {
+		bool freed = false;
+		file_handle** dirEntries = getSortedDirEntries();
+		int dirEntryCount = getSortedDirEntryCount();
+		for(int i = 0; i < dirEntryCount; i++) {
+			if(!in_range(i, current_view_start, current_view_end)
+			&& dirEntries[i]->meta && dirEntries[i]->meta->cover && trylockFile(dirEntries[i])) {
+				meta_free_cover(dirEntries[i]->meta);
+				unlockFile(dirEntries[i]);
+				freed = true;
+				break;
+			}
+		}
+		if(!freed) return NULL;	// everything left is on screen, give up for now
+		ptr = mspace_memalign(cover_mspace, 32, size);
+	}
+	return ptr;
+}
+
+// Tries to read one .cvr file into f->meta. Returns true on success.
+static bool meta_read_cover_file(file_handle *f, const char *relPath) {
+	bool ok = false;
+	file_handle *coverFile = calloc(1, sizeof(file_handle));
+	if(!coverFile) return false;
+	concat_path(coverFile->name, f->device->initial->name, relPath);
+	coverFile->device = f->device;
+
+	if(f->device->readFile(coverFile, NULL, 0) == 0 && coverFile->size > COVER_HEADER_SIZE) {
+		u8 *hdr = memalign(32, COVER_HEADER_SIZE);
+		f->device->seekFile(coverFile, 0, DEVICE_HANDLER_SEEK_SET);
+		if(hdr && f->device->readFile(coverFile, hdr, COVER_HEADER_SIZE) == COVER_HEADER_SIZE
+		&& !memcmp(hdr, COVER_MAGIC, 4)) {
+			u16 width  = (hdr[4] << 8) | hdr[5];
+			u16 height = (hdr[6] << 8) | hdr[7];
+			u8 fmt = hdr[8];
+			bool fmtOk = (fmt == GX_TF_CMPR || fmt == GX_TF_RGB565 || fmt == GX_TF_RGB5A3);
+			if(fmtOk && width && height && width <= COVER_MAX_DIM && height <= COVER_MAX_DIM
+			&& !(width & 7) && !(height & 7)) {
+				u32 size = GX_GetTexBufferSize(width, height, fmt, GX_FALSE, 0);
+				if(size <= COVER_MAX_SIZE && coverFile->size >= COVER_HEADER_SIZE + size) {
+					u8 *data = cover_alloc(size);
+					if(data) {
+						if(f->device->readFile(coverFile, data, size) == size) {
+							DCFlushRange(data, size);
+							f->meta->cover = data;
+							f->meta->coverSize = size;
+							GX_InitTexObj(&f->meta->coverTexObj, data, width, height, fmt, GX_CLAMP, GX_CLAMP, GX_FALSE);
+							GX_InitTexObjFilterMode(&f->meta->coverTexObj, GX_LINEAR, GX_LINEAR);
+							ok = true;
+						}
+						else {
+							mspace_free(cover_mspace, data);
+						}
+					}
+				}
+			}
+		}
+		free(hdr);
+	}
+	f->device->closeFile(coverFile);
+	free(coverFile);
+	return ok;
+}
+
+// Loads the cover for a file if it has one. Safe to call every frame: it only
+// touches the device the first time (or again after the cover was evicted).
+bool meta_load_cover(file_handle *f) {
+	if(!f->meta) return false;
+	if(f->meta->cover) return true;
+	if(f->meta->coverTried) return false;
+	if(f->fileType != IS_FILE && f->fileType != IS_DIR) return false;
+	if(!f->device || !f->device->initial) return false;
+	f->meta->coverTried = true;
+
+	char path[PATHNAME_MAX];
+	// By game ID (GCM/ISO), most specific first
+	if(f->meta->diskId.gamename[0]) {
+		snprintf(path, sizeof(path), "swiss/covers/%.4s%.2s.cvr", f->meta->diskId.gamename, f->meta->diskId.company);
+		if(meta_read_cover_file(f, path)) return true;
+		snprintf(path, sizeof(path), "swiss/covers/%.4s.cvr", f->meta->diskId.gamename);
+		if(meta_read_cover_file(f, path)) return true;
+	}
+	// By file/folder name without extension
+	const char *base = getRelativeName(f->name);
+	const char *dot = (f->fileType == IS_FILE) ? strrchr(base, '.') : NULL;
+	int len = dot ? (int)(dot - base) : (int)strlen(base);
+	if(len > 0) {
+		snprintf(path, sizeof(path), "swiss/covers/%.*s.cvr", len, base);
+		if(meta_read_cover_file(f, path)) return true;
+	}
+	return false;
 }
 
 file_meta* meta_alloc() {

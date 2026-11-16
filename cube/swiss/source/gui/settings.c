@@ -51,7 +51,7 @@ char *sramLanguageStr[] = {"English", "German", "French", "Spanish", "Italian", 
 char *sramVideoStr[] = {"NTSC", "PAL", "PAL-M"};
 char *igrTypeStr[] = {"Disabled", "Reboot", "Apploader"};
 char *aveCompatStr[] = {"AVE N-DOL", "AVE P-DOL", "CMPV-DOL", "GCDigital", "GCVideo", "AVE-RVL"};
-char *fileBrowserTypeStr[] = {"Standard", "Fullwidth", "Carousel"};
+char *fileBrowserTypeStr[] = {"Standard", "Fullwidth", "Carousel", "Cover Flow"};
 char *bs2BootStr[] = {"No", "Yes", "Sound 1", "Sound 2"};
 char *recentListLevelStr[] = {"Off", "Lazy", "On"};
 
@@ -151,7 +151,8 @@ static char *tooltips_interface[PAGE_INTERFACE_MAX+1] = {
 		"side information panels.\n\n"
 		"Carousel - Suited towards Game/DOL only use, consider combining\n"
 		"this option with the \223File Management\224 setting turned off and\n"
-		"\223Hide unknown file types\224 turned on for a better experience.",
+		"\223Hide unknown file types\224 turned on for a better experience.\n\n"
+		"Cover Flow - Like Carousel, with box art from swiss/covers/.",
 	[SET_APPSBROWSER_TYPE] = "File Browser Type for apps:\n\n"
 		"Applicable to the /apps directory.",
 	[SET_GAMEBROWSER_TYPE] = "File Browser Type for games:\n\n"

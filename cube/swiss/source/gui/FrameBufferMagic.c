@@ -197,6 +197,7 @@ typedef struct drawFileBrowserButtonEvent {
 	int alpha;
 	bool isAutoLoadEntry;
 	bool isCarousel;	// Draw this as a full "card" style
+	bool isCoverflow;	// Draw this as a cover art entry (cover flow browser)
 	int distFromMiddle;	// 0 = full, -1 spine only but large then gradually getting smaller as dist increases from 0
 } drawFileBrowserButtonEvent_t;
 
@@ -279,6 +280,9 @@ static void clearNestedEvent(uiDrawObj_t *event) {
 				if(((drawFileBrowserButtonEvent_t*)event->data)->file->meta) {
 					if(((drawFileBrowserButtonEvent_t*)event->data)->file->meta->banner) {
 						free(((drawFileBrowserButtonEvent_t*)event->data)->file->meta->banner);
+					}
+					if(((drawFileBrowserButtonEvent_t*)event->data)->file->meta->cover) {
+						free(((drawFileBrowserButtonEvent_t*)event->data)->file->meta->cover);
 					}
 					free(((drawFileBrowserButtonEvent_t*)event->data)->file->meta);
 				}
@@ -1150,11 +1154,108 @@ uiDrawObj_t* DrawContainer()
 	return event;
 }
 
+// Draws a textured quad whose left and right edges can have different heights,
+// which fakes the "turned towards the middle" look of a cover flow.
+static void _DrawPerspectiveQuad(float x1, float x2, float yl1, float yl2, float yr1, float yr2, u8 shade, u8 alpha) {
+	GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+		GX_Position3f32(x1, yl1, 0.0f);
+		GX_Color4u8(shade, shade, shade, alpha);
+		GX_TexCoord2f32(0.0f, 0.0f);
+		GX_Position3f32(x2, yr1, 0.0f);
+		GX_Color4u8(shade, shade, shade, alpha);
+		GX_TexCoord2f32(1.0f, 0.0f);
+		GX_Position3f32(x2, yr2, 0.0f);
+		GX_Color4u8(shade, shade, shade, alpha);
+		GX_TexCoord2f32(1.0f, 1.0f);
+		GX_Position3f32(x1, yl2, 0.0f);
+		GX_Color4u8(shade, shade, shade, alpha);
+		GX_TexCoord2f32(0.0f, 1.0f);
+	GX_End();
+}
+
+// Internal - one entry of the cover flow browser
+static void _DrawCoverflowEntry(drawFileBrowserButtonEvent_t *data) {
+	file_handle *file = data->file;
+	int dist = data->distFromMiddle;
+	int width = data->x2 - data->x1;
+	int height = data->y2 - data->y1;
+	int x_mid = data->x1 + width/2;
+
+	// Side entries are turned towards the middle: their outer edge is shorter
+	float shrink = dist == 0 ? 0.0f : height * 0.08f;
+	float yl1 = data->y1, yl2 = data->y2, yr1 = data->y1, yr2 = data->y2;
+	if(dist < 0) { yl1 += shrink; yl2 -= shrink; }
+	if(dist > 0) { yr1 += shrink; yr2 -= shrink; }
+	// ...and darker the further away they are
+	int shadeInt = dist == 0 ? 255 : 200 - 30 * (abs(dist) - 1);
+	u8 shade = shadeInt < 80 ? 80 : shadeInt;
+
+	drawInit();
+	if(file->meta && file->meta->cover) {
+		// Silver frame behind the selected cover
+		if(dist == 0) {
+			_DrawSimpleBox(data->x1, data->y1, width, height, 0, (GXColor){0,0,0,0}, (GXColor){200,200,200,GUI_MSGBOX_ALPHA});
+		}
+		GX_InvalidateTexAll();
+		GX_LoadTexObj(&file->meta->coverTexObj, GX_TEXMAP0);
+		_DrawPerspectiveQuad(data->x1, data->x2, yl1, yl2, yr1, yr2, shade, data->alpha);
+	}
+	else {
+		// No cover: a card with the banner (or file type icon) in the middle
+		GXColor fill = (GXColor) {0,0,0,dist == 0 ? 200 : 160};
+		GXColor border = (GXColor) {shade,shade,shade,GUI_MSGBOX_ALPHA};
+		_DrawSimpleBox(data->x1, data->y1 + (int)(shrink/2), width, height - (int)shrink, 0, fill, border);
+		if(file->meta && (file->meta->banner || file->meta->fileTypeTexObj)) {
+			GXTexObj *texObj = file->meta->banner ? &file->meta->bannerTexObj : file->meta->fileTypeTexObj;
+			int bnr_width = file->meta->banner ? 96 : 32;
+			int bnr_height = 32;
+			if(bnr_width > width - 8) {
+				bnr_height = bnr_height * (width - 8) / bnr_width;
+				bnr_width = width - 8;
+			}
+			if(file->meta->banner) {
+				GX_SetNumTevStages(1);
+				GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+			}
+			GX_InvalidateTexAll();
+			GXTlutObj *tlutObj = GX_GetTexObjUserData(texObj);
+			if(tlutObj) GX_LoadTlut(tlutObj, GX_GetTexObjTlut(texObj));
+			GX_LoadTexObj(texObj, GX_TEXMAP0);
+			int y_mid = data->y1 + height/2;
+			_DrawPerspectiveQuad(x_mid - bnr_width/2, x_mid + bnr_width/2, y_mid - bnr_height/2, y_mid + bnr_height/2,
+								y_mid - bnr_height/2, y_mid + bnr_height/2, shade, data->alpha);
+			drawInit();
+		}
+		// Name inside the card for side entries without a cover, written vertically like a box spine
+		if(dist != 0) {
+			drawStringEllipsis(x_mid + 6, data->y2 - 10 - (int)(shrink/2), data->displayName, 0.45f, ALIGN_LEFT,
+								(GXColor){shade,shade,shade,255}, true, height/2 - 20);
+		}
+	}
+
+	if(dist == 0) {
+		drawInit();
+		// Title under the main cover
+		float scale = GetTextScaleToFitInWidthWithMax(data->displayName, 560, 0.75f);
+		drawString(320, data->y2 + 12, data->displayName, scale, ALIGN_CENTER, defaultColor);
+		if(data->isAutoLoadEntry) {
+			_DrawImageNow(TEX_STAR, data->x2 - 16, data->y1, 16, 16, 0, 0.0f, 1.0f, 0.0f, 1.0f, 0);
+		}
+		if(file->meta && file->meta->regionTexObj) {
+			_DrawTexObjNow(file->meta->regionTexObj, data->x2 + 12, data->y2 - 20, 32, 20, 0, 0.0f, 1.0f, 0.0f, 1.0f, 0);
+		}
+	}
+}
+
 // Internal
 static void _DrawFileBrowserButton(uiDrawObj_t *evt) {
-	
+
 	drawFileBrowserButtonEvent_t *data = (drawFileBrowserButtonEvent_t*)evt->data;
-	int borderSize = 4;	
+	if(data->isCoverflow) {
+		_DrawCoverflowEntry(data);
+		return;
+	}
+	int borderSize = 4;
 	if(data->isCarousel) {	
 		// Not selected
 		GXColor noColor 	= (GXColor) {0,0,0,128};
@@ -1411,6 +1512,17 @@ uiDrawObj_t* DrawFileBrowserButton(int x1, int y1, int x2, int y2, const char *m
 			eventData->file->meta->banner = NULL;
 			eventData->file->meta->bannerSize = 0;
 		}
+		// Same for the cover art: the original can be evicted from the cover cache at any time
+		eventData->file->meta->cover = NULL;
+		if(file->meta->cover && file->meta->coverSize) {
+			u8 *coverCopy = memalign(32, file->meta->coverSize);
+			if(coverCopy) {
+				memcpy(coverCopy, file->meta->cover, file->meta->coverSize);
+				DCFlushRange(coverCopy, file->meta->coverSize);
+				eventData->file->meta->cover = coverCopy;
+				GX_InitTexObjData(&eventData->file->meta->coverTexObj, coverCopy);
+			}
+		}
 		if(eventData->file->meta->displayName == file->meta->bannerDesc.gameName) {
 			eventData->file->meta->displayName = eventData->file->meta->bannerDesc.gameName;
 		}
@@ -1469,6 +1581,14 @@ uiDrawObj_t* DrawFileCarouselEntry(int x1, int y1, int x2, int y2, const char *m
 	data->isCarousel = true;
 	data->distFromMiddle = distFromMiddle;
 	//print_debug("message %s dist = %i x: (%i -> %i) y: (%i -> %i)\n", message, distFromMiddle, x1, x2, y1, y2);
+	return event;
+}
+
+uiDrawObj_t* DrawFileCoverflowEntry(int x1, int y1, int x2, int y2, const char *message, file_handle *file, int distFromMiddle) {
+	uiDrawObj_t* event = DrawFileBrowserButtonMeta(x1, y1, x2, y2, message, file, B_SELECTED);
+	drawFileBrowserButtonEvent_t *data = (drawFileBrowserButtonEvent_t*)event->data;
+	data->isCoverflow = true;
+	data->distFromMiddle = distFromMiddle;
 	return event;
 }
 

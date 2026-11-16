@@ -49,6 +49,10 @@ typedef struct {
 	GXTlutObj bannerTlutObj;
 	BNRDesc bannerDesc;
 	char osType[BNR_SHORT_TEXT_LEN];
+	u8 *cover;			// Cover art texture data (GX format), loaded on demand by the cover flow browser
+	u32 coverSize;
+	bool coverTried;	// Set once we've looked for a cover so we don't hit the device every frame
+	GXTexObj coverTexObj;
 } file_meta;
 
 typedef struct DEVICEHANDLER_STRUCT DEVICEHANDLER_INTERFACE;
